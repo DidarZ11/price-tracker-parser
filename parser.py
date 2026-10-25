@@ -1,10 +1,15 @@
+import argparse
 import asyncio
 import csv
+import html
 import logging
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 import aiohttp
 from bs4 import BeautifulSoup
+from config import BOT_TOKEN, CHAT_ID, DB_PATH
+from notifier import TelegramNotifier
+from storage import PriceStorage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -50,7 +55,7 @@ class Parser:
             price=price,
             currency="GBP",
             url=url,
-            scraped_at=datetime.utcnow().isoformat(),
+            scraped_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         )
 
     async def scrape(self, urls: list[str]) -> list[Product]:
@@ -74,19 +79,87 @@ def save_csv(products: list[Product], path: str):
             writer.writerow(asdict(p))
 
 
-async def main():
-    base = "https://books.toscrape.com/catalogue/"
-    urls = [
-        f"{base}a-light-in-the-attic_1000/index.html",
-        f"{base}tipping-the-velvet_999/index.html",
-        f"{base}soumission_998/index.html",
-        f"{base}sharp-objects_997/index.html",
-        f"{base}sapiens-a-brief-history-of-humankind_996/index.html",
-    ]
-    parser = Parser(concurrency=5)
-    products = await parser.scrape(urls)
+URLS = [
+    f"https://books.toscrape.com/catalogue/{slug}/index.html"
+    for slug in (
+        "a-light-in-the-attic_1000",
+        "tipping-the-velvet_999",
+        "soumission_998",
+        "sharp-objects_997",
+        "sapiens-a-brief-history-of-humankind_996",
+    )
+]
+
+
+@dataclass
+class PriceChange:
+    product: Product
+    old_price: float
+
+    @property
+    def percent(self) -> float:
+        return (self.product.price - self.old_price) / self.old_price * 100
+
+
+def track(products: list[Product], storage: PriceStorage) -> tuple[list[PriceChange], list[Product]]:
+    """Сравнивает с последней сохранённой ценой и пишет новую точку в историю."""
+    changes, new = [], []
+    for p in products:
+        old = storage.last_price(p.url)
+        if old is None:
+            new.append(p)
+        elif old != p.price:
+            changes.append(PriceChange(p, old))
+        storage.add(p)
+    return changes, new
+
+
+def format_report(changes: list[PriceChange], new: list[Product]) -> str:
+    lines = []
+    if changes:
+        lines.append("<b>Изменились цены:</b>")
+        for c in changes:
+            arrow = "📉" if c.percent < 0 else "📈"
+            lines.append(
+                f'{arrow} <a href="{c.product.url}">{html.escape(c.product.title)}</a>: '
+                f"{c.old_price:.2f} → {c.product.price:.2f} {c.product.currency} ({c.percent:+.1f}%)"
+            )
+    if new:
+        if lines:
+            lines.append("")
+        lines.append(f"<b>Начал отслеживать {len(new)} товаров:</b>")
+        lines += [f"• {html.escape(p.title)} — {p.price:.2f} {p.currency}" for p in new]
+    return "\n".join(lines)
+
+
+async def run_once(parser: Parser, storage: PriceStorage, notifier: TelegramNotifier | None):
+    products = await parser.scrape(URLS)
     save_csv(products, "products.csv")
-    log.info("scraped %d products", len(products))
+    changes, new = track(products, storage)
+    log.info("scraped %d products: %d price changes, %d new", len(products), len(changes), len(new))
+    if notifier and (changes or new):
+        await notifier.send(format_report(changes, new), document="products.csv")
+
+
+async def main():
+    ap = argparse.ArgumentParser(description="Трекер цен с уведомлениями в Telegram")
+    ap.add_argument("--every", type=int, metavar="MIN", help="повторять проверку каждые MIN минут")
+    args = ap.parse_args()
+
+    parser = Parser(concurrency=5)
+    storage = PriceStorage(DB_PATH)
+    notifier = TelegramNotifier(BOT_TOKEN, CHAT_ID) if BOT_TOKEN else None
+    if notifier is None:
+        log.warning("BOT_TOKEN не задан — уведомления в Telegram отключены")
+    try:
+        while True:
+            await run_once(parser, storage, notifier)
+            if not args.every:
+                break
+            log.info("следующая проверка через %d мин", args.every)
+            await asyncio.sleep(args.every * 60)
+    finally:
+        storage.close()
 
 
 if __name__ == "__main__":
